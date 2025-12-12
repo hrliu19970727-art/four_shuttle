@@ -1,4 +1,4 @@
-# main.py (完整修复版)
+# main.py
 import simpy
 import threading
 import time
@@ -151,6 +151,18 @@ def generate_nearby_release_tasks(n, shuttle_positions):
         return []
 
     tasks = []
+
+    # 获取当前已有的任务位置，避免任务重复生成
+    existing_task_positions = set()
+    with state_lock:
+        existing_task_positions.update(task.position for task in shared_state["release_tasks"])
+        existing_task_positions.update(task.position for task in shared_state["pick_tasks"])
+
+    available = [pos for pos in available if pos not in existing_task_positions]
+
+    if not available:
+        return []
+
     for i in range(min(n, len(available))):
         # 优先选择靠近小车的位置
         nearby_positions = []
@@ -160,10 +172,14 @@ def generate_nearby_release_tasks(n, shuttle_positions):
             if min_distance <= 10:  # 只考虑距离10以内的位置
                 nearby_positions.append((pos, min_distance))
 
+        pos = None
+        min_distance = -1
+
         if nearby_positions:
             # 选择最近的位置
             nearby_positions.sort(key=lambda x: x[1])
             pos = nearby_positions[0][0]
+            min_distance = nearby_positions[0][1]
         else:
             # 如果没有附近位置，随机选择
             pos = random.choice(available)
@@ -171,7 +187,7 @@ def generate_nearby_release_tasks(n, shuttle_positions):
         task = Task(i, pos, "release")
         tasks.append(task)
         available.remove(pos)
-        print(f"  附近放货任务 {i}: {pos} (距离: {nearby_positions[0][1] if nearby_positions else '随机选择'})")
+        print(f"  附近放货任务 {i}: {pos} (距离: {min_distance if min_distance != -1 else '随机选择'})")
 
     return tasks
 
@@ -185,6 +201,18 @@ def generate_release_tasks(n):
 
     n = min(n, len(available))
     tasks = []
+
+    # 获取当前已有的任务位置
+    existing_task_positions = set()
+    with state_lock:
+        existing_task_positions.update(task.position for task in shared_state["release_tasks"])
+        existing_task_positions.update(task.position for task in shared_state["pick_tasks"])
+
+    available = [pos for pos in available if pos not in existing_task_positions]
+
+    if not available:
+        return []
+
     for i in range(n):
         pos = random.choice(available)
         task = Task(i, pos, "release")
@@ -279,7 +307,7 @@ def move_shuttle(env, shuttle_id, path):
             if hasattr(warehouse, 'add_shuttle'):
                 warehouse.add_shuttle(step[0], step[1], shuttle_id)
 
-            print(f"  小车{shuttle_id} 移动到: {step}")
+            # print(f"  小车{shuttle_id} 移动到: {step}")
 
         # 移动时间
         yield env.timeout(MOVE_TIME)
@@ -288,66 +316,71 @@ def move_shuttle(env, shuttle_id, path):
 
 
 def execute_task_operation(env, shuttle_id, task, task_type):
-    """执行任务操作 - 支持近距离执行"""
-    try:
-        r, c = task.position
+    """
+    执行任务操作 - 解决死锁问题
+    【关键修复】将需要长时间 SimPy yield 的部分移到锁外。
+    """
+    r, c = task.position
 
-        with state_lock:
-            current_pos = tuple(shared_state["shuttles"][shuttle_id]["pos"])
-            distance = manhattan_distance(current_pos, task.position)
+    # 1. 检查和更新前置状态 (需要锁)
+    with state_lock:
+        current_pos = tuple(shared_state["shuttles"][shuttle_id]["pos"])
+        distance = manhattan_distance(current_pos, task.position)
 
-            # 放宽距离限制，允许相邻位置执行任务
-            if distance > 1:
-                print(f"✗ 小车{shuttle_id} 距离目标太远: {distance} 步")
-                # 检查是否在相邻位置
-                adjacent_positions = [
-                    (task.position[0] - 1, task.position[1]),
-                    (task.position[0] + 1, task.position[1]),
-                    (task.position[0], task.position[1] - 1),
-                    (task.position[0], task.position[1] + 1)
-                ]
+        # 检查任务执行位置
+        if distance > 1:
+            adjacent_positions = [
+                (task.position[0] - 1, task.position[1]),
+                (task.position[0] + 1, task.position[1]),
+                (task.position[0], task.position[1] - 1),
+                (task.position[0], task.position[1] + 1)
+            ]
+            if current_pos not in adjacent_positions:
+                print(f"✗ 小车{shuttle_id} 距离目标太远: {distance} 步，任务失败")
+                log_task_completion(task_type, task.position, env.now, env.now, False)
+                return False
+            else:
+                print(f"  在相邻位置，允许执行任务")
 
-                if current_pos not in adjacent_positions:
-                    return False
-                else:
-                    print(f"  在相邻位置，允许执行任务")
+        shared_state["shuttles"][shuttle_id]["status"] = f"执行{task_type}"
 
-            shared_state["shuttles"][shuttle_id]["status"] = f"执行{task_type}"
+        if task_type == "release":
+            if shared_state["slots"][r][c] != 1:  # 位置非空闲
+                print(f"✗ 小车{shuttle_id} 放货失败: 位置被占用")
+                log_task_completion("放货", task.position, env.now, env.now, False)
+                return False
+        else:  # pick
+            if shared_state["slots"][r][c] != 2:  # 位置无货
+                print(f"✗ 小车{shuttle_id} 取货失败: 位置无货")
+                log_task_completion("取货", task.position, env.now, env.now, False)
+                return False
 
-            if task_type == "release":
-                if shared_state["slots"][r][c] == 1:  # 位置空闲
-                    shared_state["slots"][r][c] = 2
-                    if hasattr(warehouse, 'update_slot'):
-                        warehouse.update_slot(r, c, 2)
-                    print(f"小车{shuttle_id} 放货中... (距离: {distance})")
-                    yield env.timeout(PARK_TIME)
-                    log_task_completion("放货", task.position, env.now - PARK_TIME, env.now, True)
-                    print(f"✓ 小车{shuttle_id} 放货完成 at {task.position}")
-                    return True
-                else:
-                    print(f"✗ 小车{shuttle_id} 放货失败: 位置被占用")
-                    log_task_completion("放货", task.position, env.now, env.now, False)
-                    return False
+        # 确定需要消耗的时间
+        op_time = PARK_TIME if task_type == "release" else RETRIEVE_TIME
 
-            else:  # pick
-                if shared_state["slots"][r][c] == 2:  # 位置有货
-                    shared_state["slots"][r][c] = 1
-                    if hasattr(warehouse, 'update_slot'):
-                        warehouse.update_slot(r, c, 1)
-                    print(f"小车{shuttle_id} 取货中... (距离: {distance})")
-                    yield env.timeout(RETRIEVE_TIME)
-                    log_task_completion("取货", task.position, env.now - RETRIEVE_TIME, env.now, True)
-                    print(f"✓ 小车{shuttle_id} 取货完成 at {task.position}")
-                    return True
-                else:
-                    print(f"✗ 小车{shuttle_id} 取货失败: 位置无货")
-                    log_task_completion("取货", task.position, env.now, env.now, False)
-                    return False
+    # 2. 消耗时间 (不需要锁，避免死锁)
+    print(f"小车{shuttle_id} {task_type}中... (消耗时间: {op_time})")
+    yield env.timeout(op_time)
 
-    except Exception as e:
-        print(f"小车{shuttle_id} 任务操作错误: {e}")
-        log_task_completion(task_type, task.position, env.now, env.now, False)
-        return False
+    # 3. 任务完成后的状态更新 (需要锁)
+    with state_lock:
+        if task_type == "release":
+            shared_state["slots"][r][c] = 2
+            if hasattr(warehouse, 'update_slot'):
+                warehouse.update_slot(r, c, 2)
+            log_task_completion("放货", task.position, env.now - PARK_TIME, env.now, True)
+            print(f"✓ 小车{shuttle_id} 放货完成 at {task.position}")
+        else:  # pick
+            shared_state["slots"][r][c] = 1
+            if hasattr(warehouse, 'update_slot'):
+                warehouse.update_slot(r, c, 1)
+            log_task_completion("取货", task.position, env.now - RETRIEVE_TIME, env.now, True)
+            print(f"✓ 小车{shuttle_id} 取货完成 at {task.position}")
+
+        return True  # 任务成功
+
+    # 由于步骤 2 是 SimPy yield，我们不需要 try...except 来处理 SimPy 异常，
+    # 只需要处理数据访问的异常 (已在 lock 内部处理)。
 
 
 def shuttle_controller(env, shuttle_id):
@@ -430,6 +463,7 @@ def shuttle_controller(env, shuttle_id):
             yield env.timeout(2)
             continue
 
+        task_success = False
         try:
             # 移动阶段
             with state_lock:
@@ -438,48 +472,36 @@ def shuttle_controller(env, shuttle_id):
 
             # 检查是否到达目标
             final_pos = tuple(shared_state["shuttles"][shuttle_id]["pos"])
-            task_success = False
 
-            if final_pos == task.position:
-                # 执行任务
+            # 任务执行
+            distance = manhattan_distance(final_pos, task.position)
+            if distance <= 1:
+                print(f"小车{shuttle_id} 到达目标区域，距离: {distance}")
                 task_success = yield env.process(
                     execute_task_operation(env, shuttle_id, task, task_type)
                 )
             else:
-                distance = manhattan_distance(final_pos, task.position)
                 print(f"小车{shuttle_id} 未精确到达目标: 当前位置 {final_pos}, 目标 {task.position}, 距离: {distance}")
+                log_task_completion(task_type, task.position, env.now, env.now, False)
+                consecutive_failures += 1
 
-                # 检查距离，如果很近则视为成功
-                if distance <= 1:
-                    print(f"  距离很近({distance})，尝试执行任务")
-                    task_success = yield env.process(
-                        execute_task_operation(env, shuttle_id, task, task_type)
-                    )
-                else:
-                    print(f"  距离太远({distance})，任务失败")
-                    log_task_completion(task_type, task.position, env.now, env.now, False)
-                    consecutive_failures += 1
-
-            # 重置状态
-            with state_lock:
-                shared_state["shuttles"][shuttle_id]["busy"] = False
-                shared_state["shuttles"][shuttle_id]["Load"] = False
-                shared_state["shuttles"][shuttle_id]["current_task"] = None
-                if task_success:
-                    shared_state["shuttles"][shuttle_id]["status"] = "任务完成"
-                    consecutive_failures = 0  # 重置失败计数
-                else:
-                    shared_state["shuttles"][shuttle_id]["status"] = "任务失败"
 
         except Exception as e:
             print(f"✗ 小车{shuttle_id} 任务执行异常: {e}")
             import traceback
             traceback.print_exc()
             consecutive_failures += 1
-            with state_lock:
-                shared_state["shuttles"][shuttle_id]["busy"] = False
-                shared_state["shuttles"][shuttle_id]["current_task"] = None
-                shared_state["shuttles"][shuttle_id]["status"] = "异常"
+
+        # 重置状态
+        with state_lock:
+            shared_state["shuttles"][shuttle_id]["busy"] = False
+            shared_state["shuttles"][shuttle_id]["Load"] = False
+            shared_state["shuttles"][shuttle_id]["current_task"] = None
+            if task_success:
+                shared_state["shuttles"][shuttle_id]["status"] = "任务完成"
+                consecutive_failures = 0  # 重置失败计数
+            else:
+                shared_state["shuttles"][shuttle_id]["status"] = "任务失败"
 
 
 def dynamic_task_generator(env):
@@ -666,8 +688,8 @@ if __name__ == "__main__":
     else:
         print("仿真准备超时，尝试继续...")
 
-    # # 启动可视化（在主线程运行）
-    # run_visualization_wrapper()
+    # 启动可视化（在主线程运行）
+    run_visualization_wrapper()
 
     # 等待仿真线程结束
     sim_thread.join(timeout=5)
