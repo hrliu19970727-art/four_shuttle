@@ -25,6 +25,7 @@ HIGHLIGHT_COLOR = COLORS.get("highlight", (255, 203, 0))
 def safe_render_font(text, font_size, color):
     """安全创建字体"""
     try:
+        # 使用常见的中文字体
         font = pygame.font.SysFont("simhei", font_size)
         return font.render(str(text), True, color)
     except:
@@ -43,7 +44,10 @@ def safe_render_font(text, font_size, color):
 
 
 def draw_info_panel(screen):
-    """安全绘制信息面板"""
+    """
+    绘制信息面板 -
+    【关键修复】假设 state_lock 已经被调用者持有，直接读取 shared_state
+    """
     try:
         # 绘制面板背景
         pygame.draw.rect(screen, PANEL_BG_COLOR, (MAP_WIDTH, 0, INFO_PANEL_WIDTH, TOTAL_HEIGHT))
@@ -56,8 +60,7 @@ def draw_info_panel(screen):
         y_offset += 40
 
         # 当前时间
-        with state_lock:
-            current_time = shared_state.get("time", 0)
+        current_time = shared_state.get("time", 0)
         time_text = safe_render_font(f"仿真时间: {current_time:.1f}s", FONT_SIZE_MEDIUM, TEXT_COLOR)
         screen.blit(time_text, (MAP_WIDTH + 20, y_offset))
         y_offset += 30
@@ -68,8 +71,7 @@ def draw_info_panel(screen):
         y_offset += 25
 
         # 小车状态
-        with state_lock:
-            shuttles = shared_state.get("shuttles", [])
+        shuttles = shared_state.get("shuttles", [])
 
         busy_count = 0
         for i, shuttle in enumerate(shuttles):
@@ -104,9 +106,8 @@ def draw_info_panel(screen):
         screen.blit(tasks_title, (MAP_WIDTH + 20, y_offset))
         y_offset += 25
 
-        with state_lock:
-            release_count = len(shared_state.get("release_tasks", []))
-            pick_count = len(shared_state.get("pick_tasks", []))
+        release_count = len(shared_state.get("release_tasks", []))
+        pick_count = len(shared_state.get("pick_tasks", []))
 
         release_text = safe_render_font(f"  放货任务: {release_count}", FONT_SIZE_SMALL, (100, 200, 255))
         screen.blit(release_text, (MAP_WIDTH + 20, y_offset))
@@ -122,9 +123,8 @@ def draw_info_panel(screen):
         screen.blit(status_title, (MAP_WIDTH + 20, y_offset))
         y_offset += 25
 
-        with state_lock:
-            done = shared_state.get("done", False)
-            total_tasks = release_count + pick_count
+        done = shared_state.get("done", False)
+        total_tasks = release_count + pick_count
 
         status_text = "运行中" if not done else "已结束"
         status_color = (100, 255, 100) if not done else (255, 100, 100)
@@ -177,7 +177,7 @@ def run_visualization():
         while running:
             frame_count += 1
 
-            # 处理事件
+            # 处理事件 (必须在锁外，以响应用户操作)
             for event in pygame.event.get():
                 if event.type == pygame.QUIT:
                     running = False
@@ -192,38 +192,39 @@ def run_visualization():
                         print("重新开始功能待实现")
                         # 可以在这里添加重新开始逻辑
 
-            # 检查退出条件
+            # 【关键修复】将所有对共享数据的读取和绘制放在一个锁内
             with state_lock:
+                # 检查退出条件
                 if shared_state.get("done", False):
                     running = False
 
-            # 清屏
-            screen.fill(BACKGROUND_COLOR)
+                # 清屏
+                screen.fill(BACKGROUND_COLOR)
 
-            try:
-                # 绘制仓库地图
-                if hasattr(warehouse, 'draw'):
-                    warehouse.draw(screen)
-                else:
-                    # 备用绘制
-                    for row in range(ROWS):
-                        for col in range(COLS):
-                            color = (100, 100, 150)
-                            rect = pygame.Rect(col * CELL_SIZE, row * CELL_SIZE, CELL_SIZE, CELL_SIZE)
-                            pygame.draw.rect(screen, color, rect)
-                            pygame.draw.rect(screen, (50, 50, 50), rect, 1)
+                try:
+                    # 绘制仓库地图 (访问 warehouse 全局状态，现在安全)
+                    if hasattr(warehouse, 'draw'):
+                        warehouse.draw(screen)
+                    else:
+                        # 备用绘制
+                        for row in range(ROWS):
+                            for col in range(COLS):
+                                color = (100, 100, 150)
+                                rect = pygame.Rect(col * CELL_SIZE, row * CELL_SIZE, CELL_SIZE, CELL_SIZE)
+                                pygame.draw.rect(screen, color, rect)
+                                pygame.draw.rect(screen, (50, 50, 50), rect, 1)
 
-                # 绘制信息面板
-                draw_info_panel(screen)
+                    # 绘制信息面板 (访问 shared_state，现在安全)
+                    draw_info_panel(screen)
 
-            except Exception as e:
-                print(f"绘制错误: {e}")
-                # 错误时显示简单界面
-                error_font = pygame.font.Font(None, 36)
-                error_text = error_font.render("绘制错误", True, (255, 0, 0))
-                screen.blit(error_text, (TOTAL_WIDTH // 2 - 50, TOTAL_HEIGHT // 2))
+                except Exception as e:
+                    print(f"绘制错误: {e}")
+                    # 错误时显示简单界面
+                    error_font = pygame.font.Font(None, 36)
+                    error_text = error_font.render("绘制错误", True, (255, 0, 0))
+                    screen.blit(error_text, (TOTAL_WIDTH // 2 - 50, TOTAL_HEIGHT // 2))
 
-            # 更新显示
+            # 更新显示 (必须在锁外，避免长时间占用锁)
             pygame.display.flip()
 
             # 控制帧率
