@@ -1,4 +1,4 @@
-# path_planning.py
+# path_planning.py (修复：允许驶入提升机)
 import heapq
 import random
 from config import *
@@ -20,58 +20,71 @@ def get_traffic_cost(pos, other_paths_sets):
 def get_valid_neighbors(grid_type, current, rows, cols):
     """
     根据交通规则返回可行邻居
-    【关键修复】允许从主轨道驶入相邻的存储巷道
+    【核心修复】允许从主轨道进入提升机/出入口
     """
     r, c = current
     g_type = grid_type[r][c]
-
-    # 基础候选方向 (根据单向规则)
     candidates = []
+
+    # --- 1. 基础行驶方向 (单行道限制) ---
     if g_type == TYPE_MAIN_H_EAST:
-        candidates = [(0, 1)]
+        candidates = [(0, 1)]  # 东
     elif g_type == TYPE_MAIN_H_WEST:
-        candidates = [(0, -1)]
+        candidates = [(0, -1)]  # 西
     elif g_type == TYPE_MAIN_V_SOUTH:
-        candidates = [(1, 0)]
+        candidates = [(1, 0)]  # 南
     elif g_type == TYPE_MAIN_V_NORTH:
-        candidates = [(-1, 0)]
-    else:
-        candidates = [(0, 1), (0, -1), (1, 0), (-1, 0)]  # 交叉口/巷道/电梯全向
+        candidates = [(-1, 0)]  # 北
+    elif g_type == TYPE_STORAGE:
+        candidates = [(1, 0), (-1, 0)]  # 存储巷道：仅限垂直移动
+    elif g_type in [TYPE_INTERSECTION, TYPE_ELEVATOR, TYPE_MAIN_BIDIRECTIONAL]:
+        # 全向区域
+        candidates = [(0, 1), (0, -1), (1, 0), (-1, 0)]
 
     neighbors = []
 
-    # 1. 首先添加符合单向规则的邻居
+    # --- 2. 检查常规邻居 ---
     for dr, dc in candidates:
         nr, nc = r + dr, c + dc
         if 0 <= nr < rows and 0 <= nc < cols:
             n_type = grid_type[nr][nc]
-            # 基础物理检查 + 逆行检查
-            if n_type != TYPE_NONE:
-                # 逆行保护
-                if n_type == TYPE_MAIN_H_EAST and dc == -1:
-                    pass
-                elif n_type == TYPE_MAIN_H_WEST and dc == 1:
-                    pass
-                else:
-                    neighbors.append((nr, nc))
 
-    # 2. 【新增】特殊规则：允许从主轨道“侧向”进入存储巷道
-    # 如果当前在主轨道，检查上下左右是否有存储巷道
-    if g_type in [TYPE_MAIN_H_EAST, TYPE_MAIN_H_WEST, TYPE_MAIN_V_SOUTH, TYPE_MAIN_V_NORTH]:
+            # 物理连接检查
+            if n_type == TYPE_NONE: continue
+
+            # 逆行检查 (不能逆向进入单行道)
+            if n_type == TYPE_MAIN_H_EAST and dc == -1: continue
+            if n_type == TYPE_MAIN_H_WEST and dc == 1: continue
+            if n_type == TYPE_MAIN_V_SOUTH and dr == -1: continue
+            if n_type == TYPE_MAIN_V_NORTH and dr == 1: continue
+
+            neighbors.append((nr, nc))
+
+    # --- 3. 特殊转向规则 (主轨道 -> 支路) ---
+    # 如果当前在主轨道/双向道，允许转向进入特定区域
+    if g_type in [TYPE_MAIN_H_EAST, TYPE_MAIN_H_WEST, TYPE_MAIN_V_SOUTH, TYPE_MAIN_V_NORTH, TYPE_MAIN_BIDIRECTIONAL]:
         all_dirs = [(0, 1), (0, -1), (1, 0), (-1, 0)]
         for dr, dc in all_dirs:
             nr, nc = r + dr, c + dc
             if 0 <= nr < rows and 0 <= nc < cols:
-                # 如果邻居是存储位，允许转向进入（这就解决了无法下高速的问题）
-                if grid_type[nr][nc] == TYPE_STORAGE:
-                    if (nr, nc) not in neighbors:  # 避免重复添加
-                        neighbors.append((nr, nc))
+                target_type = grid_type[nr][nc]
+
+                # 情况A: 进入存储巷道 (必须垂直进入)
+                if target_type == TYPE_STORAGE:
+                    if dc != 0: continue  # 禁止横向穿墙进入
+                    if (nr, nc) not in neighbors: neighbors.append((nr, nc))
+
+                # 情况B: 【关键修复】进入提升机/出入口 (允许任意方向)
+                # 您的入库点 (16,7) 就在主巷道 (15,7) 的下方 (dr=1, dc=0)
+                # 之前的代码漏掉了这里，导致小车路过门口进不去
+                elif target_type == TYPE_ELEVATOR:
+                    if (nr, nc) not in neighbors: neighbors.append((nr, nc))
 
     return neighbors
 
 
 def improved_a_star_search(grid_type_map, start, goal, other_paths=None):
-    """带交通规则 A*"""
+    """A* 路径规划"""
     if other_paths is None: other_paths = []
     other_paths_sets = [set(p) for p in other_paths]
 
@@ -84,7 +97,7 @@ def improved_a_star_search(grid_type_map, start, goal, other_paths=None):
     heapq.heappush(open_set, (0, 0, start, [start]))
     g_scores = {start: 0}
 
-    max_steps = 20000
+    max_steps = 40000
     steps = 0
 
     while open_set and steps < max_steps:
@@ -100,8 +113,9 @@ def improved_a_star_search(grid_type_map, start, goal, other_paths=None):
         for neighbor in neighbors:
             move_cost = get_traffic_cost(neighbor, other_paths_sets)
 
-            # 进入存储巷道增加一点代价，鼓励优先走主路
-            if grid_type_map[neighbor[0]][neighbor[1]] == TYPE_STORAGE:
+            # 进入非主干道增加代价，鼓励在主路上跑
+            n_type = grid_type_map[neighbor[0]][neighbor[1]]
+            if n_type in [TYPE_STORAGE, TYPE_ELEVATOR]:
                 move_cost += 0.5
 
             new_g = g + move_cost
@@ -109,12 +123,10 @@ def improved_a_star_search(grid_type_map, start, goal, other_paths=None):
             if neighbor not in g_scores or new_g < g_scores[neighbor]:
                 g_scores[neighbor] = new_g
                 h = manhattan_distance(neighbor, goal)
-                # 目标在主路上，增加h权重，引导尽快汇入
                 f_new = new_g + h
 
                 heapq.heappush(open_set, (f_new, new_g, neighbor, path + [neighbor]))
 
-    print(f"  规划失败: {start}->{goal}")
     return []
 
 
