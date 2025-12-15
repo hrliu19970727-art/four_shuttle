@@ -16,5 +16,7 @@ shared_state = {
 
     # 统计
     "completed_tasks": 0,
-    "failed_tasks": 0
+    "failed_tasks": 0,
+    "completed_release_tasks": 0,  # 新增：入库完成数
+    "completed_pick_tasks": 0  # 新增：出库完成数
 }

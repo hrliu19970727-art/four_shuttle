@@ -1,8 +1,8 @@
 # config.py
 # --- 地图尺寸 (User: 29 Rows, 50 Cols) ---
 ROWS = 29
-COLS = 60
-CELL_SIZE = 20  # 稍微调小一点以便在屏幕上显示全貌
+COLS = 50
+CELL_SIZE = 22  # 稍微调小一点以便在屏幕上显示全貌
 
 # --- 实体数量 ---
 SHUTTLES = 6

@@ -13,26 +13,15 @@ from config import *
 from shared_state import shared_state, state_lock
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
-SIMULATION_DELAY = 0.05
+SIMULATION_DELAY = 0.0001
 simulation_ready = threading.Event()
 visualization_started = threading.Event()
 
-# --- 坐标定义 (系统坐标系) ---
-# 需要将用户坐标 (行, 列) 转换为系统坐标 (ROW-r, c-1)
-# 入库点: (13, 8), (20, 6)
-INPUT_POINTS = [
-    (ROWS - 13, 8 - 1),
-    (ROWS - 20, 6 - 1)
-]
-# 出库点: (14, 47), (20, 49)
-OUTPUT_POINTS = [
-    (ROWS - 14, 47 - 1),
-    (ROWS - 20, 49 - 1)
-]
+INPUT_POINTS = [(ROWS - 13, 8 - 1), (ROWS - 20, 6 - 1)]
+OUTPUT_POINTS = [(ROWS - 14, 47 - 1), (ROWS - 20, 49 - 1)]
 
 
 def get_nearest(points, current_pos):
-    """找到最近的入/出库点"""
     best_p = points[0]
     min_dist = float('inf')
     for p in points:
@@ -43,15 +32,21 @@ def get_nearest(points, current_pos):
     return best_p
 
 
+def is_occupied(pos, my_id):
+    with state_lock:
+        for s in shared_state["shuttles"]:
+            if s["id"] != my_id and tuple(s["pos"]) == pos:
+                return True
+    return False
+
+
 def initialize_shared_state():
     with state_lock:
-        # 初始位置：随机选择存储巷道
         valid_pos = []
         for r in range(ROWS):
             for c in range(COLS):
                 if warehouse.grid_type[r][c] == TYPE_STORAGE:
                     valid_pos.append((r, c))
-
         random.shuffle(valid_pos)
         chosen = valid_pos[:SHUTTLES]
 
@@ -66,22 +61,19 @@ def initialize_shared_state():
         shared_state["pick_tasks"] = []
         shared_state["completed_tasks"] = 0
         shared_state["failed_tasks"] = 0
+        shared_state["completed_release_tasks"] = 0  # 新增初始化
+        shared_state["completed_pick_tasks"] = 0  # 新增初始化
         shared_state["time"] = 0
         shared_state["done"] = False
-
         print(f"初始化完成: {SHUTTLES}辆小车")
 
 
 def generate_tasks(env):
-    """任务生成器"""
     print("任务生成器启动")
     while not shared_state["done"]:
         yield env.timeout(random.randint(5, 15))
         if shared_state["done"]: break
-
-        # 简单的任务生成逻辑
         with state_lock:
-            # 统计空闲和占用货位
             empties = []
             filled = []
             for r in range(ROWS):
@@ -92,10 +84,8 @@ def generate_tasks(env):
                         elif shared_state["slots"][r][c] == 2:
                             filled.append((r, c))
 
-            # 避免重复任务
             active_pos = set()
-            for t in shared_state["release_tasks"] + shared_state["pick_tasks"]:
-                active_pos.add(t.position)
+            for t in shared_state["release_tasks"] + shared_state["pick_tasks"]: active_pos.add(t.position)
             for s in shared_state["shuttles"]:
                 if s["current_task"]: active_pos.add(s["current_task"].position)
 
@@ -103,8 +93,7 @@ def generate_tasks(env):
             filled = [p for p in filled if p not in active_pos]
 
             cnt = len(shared_state["release_tasks"]) + len(shared_state["pick_tasks"])
-            if cnt < 10:
-                # 随机生成入库或出库
+            if cnt < 6:
                 if empties and random.random() < 0.6:
                     pos = random.choice(empties)
                     shared_state["release_tasks"].append(Task(0, pos, "release"))
@@ -116,25 +105,29 @@ def generate_tasks(env):
 
 
 def move_shuttle(env, s_id, path):
-    """执行移动"""
     if not path: return
-    # 如果已经在起点，跳过第一个点
     start_idx = 1 if path[0] == tuple(shared_state["shuttles"][s_id]["pos"]) else 0
     actual_path = path[start_idx:]
 
     for i, step in enumerate(actual_path):
-        with state_lock:
-            shared_state["shuttles"][s_id]["pos"] = list(step)
-            shared_state["shuttles"][s_id]["path"] = actual_path[i:]
-            shared_state["shuttles"][s_id]["status"] = "移动中"
-            shared_state["shuttles"][s_id]["battery"] -= 0.05
+        while True:
+            if not is_occupied(step, s_id):
+                move_success = False
+                with state_lock:
+                    if not is_occupied(step, s_id):
+                        shared_state["shuttles"][s_id]["pos"] = list(step)
+                        shared_state["shuttles"][s_id]["path"] = actual_path[i:]
+                        shared_state["shuttles"][s_id]["status"] = "移动中"
+                        shared_state["shuttles"][s_id]["battery"] -= 0.05
+                        move_success = True
+                if move_success: break
+            yield env.timeout(0.5)
 
         yield env.timeout(MOVE_TIME)
         if SIMULATION_DELAY: time.sleep(SIMULATION_DELAY)
 
 
 def execute_op_sim(env, s_id, duration, status_text):
-    """模拟操作耗时（无状态改变）"""
     with state_lock:
         shared_state["shuttles"][s_id]["status"] = status_text
     yield env.timeout(duration)
@@ -142,18 +135,12 @@ def execute_op_sim(env, s_id, duration, status_text):
 
 
 def controller(env, s_id):
-    """
-    小车控制器 - 实现两段式逻辑
-    入库: 1.去入库点(取) -> 2.去货位(放)
-    出库: 1.去货位(取) -> 2.去出库点(放)
-    """
     yield env.timeout(random.random())
 
     while True:
         with state_lock:
             if shared_state["done"]: break
 
-        # 1. 获取任务
         task = None
         t_type = None
         with state_lock:
@@ -169,7 +156,6 @@ def controller(env, s_id):
             yield env.timeout(1)
             continue
 
-        # 2. 执行任务逻辑
         try:
             with state_lock:
                 shared_state["shuttles"][s_id]["busy"] = True
@@ -177,96 +163,86 @@ def controller(env, s_id):
 
             success = False
 
-            # --- 入库流程 (Release) ---
-            if t_type == "release":
-                # 第一步: 去入库点取货
+            def get_planning_params(target_pos):
                 with state_lock:
-                    cur = tuple(shared_state["shuttles"][s_id]["pos"])
-                    input_pt = get_nearest(INPUT_POINTS, cur)
-                    others = [s["path"] for s in shared_state["shuttles"] if s["id"] != s_id]
+                    c_pos = tuple(shared_state["shuttles"][s_id]["pos"])
+                    others_p = [s["path"] for s in shared_state["shuttles"] if s["id"] != s_id]
+                    obstacles = [tuple(s["pos"]) for s in shared_state["shuttles"] if s["id"] != s_id]
+                return c_pos, others_p, obstacles
 
-                print(f"小车{s_id} (入库) -> 前往入库点 {input_pt}")
-                path1 = improved_a_star_search(warehouse.grid_type, cur, input_pt, others)
+            if t_type == "release":
+                cur, others, obs = get_planning_params(INPUT_POINTS[0])
+                input_pt = get_nearest(INPUT_POINTS, cur)
+                print(f"小车{s_id} (入库) -> 入库点 {input_pt}")
+                path1 = improved_a_star_search(warehouse.grid_type, cur, input_pt, others, obs)
 
                 if path1:
                     yield env.process(move_shuttle(env, s_id, path1))
-                    yield env.process(execute_op_sim(env, s_id, PARK_TIME, "入库点取货"))
+                    yield env.process(execute_op_sim(env, s_id, PARK_TIME, "取货"))
                     with state_lock:
                         shared_state["shuttles"][s_id]["Load"] = True
 
-                    # 第二步: 去存储位放货
-                    with state_lock:
-                        cur = tuple(shared_state["shuttles"][s_id]["pos"])
-                        others = [s["path"] for s in shared_state["shuttles"] if s["id"] != s_id]
-
-                    print(f"小车{s_id} (入库) -> 前往货位 {task.position}")
-                    path2 = improved_a_star_search(warehouse.grid_type, cur, task.position, others)
+                    cur, others, obs = get_planning_params(task.position)
+                    print(f"小车{s_id} (入库) -> 货位 {task.position}")
+                    path2 = improved_a_star_search(warehouse.grid_type, cur, task.position, others, obs)
 
                     if path2:
                         yield env.process(move_shuttle(env, s_id, path2))
-                        yield env.process(execute_op_sim(env, s_id, PARK_TIME, "货位放货"))
-                        # 更新货位状态
+                        yield env.process(execute_op_sim(env, s_id, PARK_TIME, "放货"))
                         with state_lock:
                             r, c = task.position
-                            shared_state["slots"][r][c] = 2  # 占用
+                            shared_state["slots"][r][c] = 2
                             warehouse.update_slot(r, c, 2)
                             shared_state["shuttles"][s_id]["Load"] = False
                         success = True
 
-            # --- 出库流程 (Pick) ---
             elif t_type == "pick":
-                # 第一步: 去存储位取货
-                with state_lock:
-                    cur = tuple(shared_state["shuttles"][s_id]["pos"])
-                    others = [s["path"] for s in shared_state["shuttles"] if s["id"] != s_id]
-
-                print(f"小车{s_id} (出库) -> 前往货位 {task.position}")
-                path1 = improved_a_star_search(warehouse.grid_type, cur, task.position, others)
+                cur, others, obs = get_planning_params(task.position)
+                print(f"小车{s_id} (出库) -> 货位 {task.position}")
+                path1 = improved_a_star_search(warehouse.grid_type, cur, task.position, others, obs)
 
                 if path1:
                     yield env.process(move_shuttle(env, s_id, path1))
-                    yield env.process(execute_op_sim(env, s_id, RETRIEVE_TIME, "货位取货"))
-
-                    # 更新货位状态 (取走变空)
+                    yield env.process(execute_op_sim(env, s_id, RETRIEVE_TIME, "取货"))
                     with state_lock:
                         r, c = task.position
-                        shared_state["slots"][r][c] = 1  # 空闲
+                        shared_state["slots"][r][c] = 1
                         warehouse.update_slot(r, c, 1)
                         shared_state["shuttles"][s_id]["Load"] = True
 
-                    # 第二步: 去出库点放货
-                    with state_lock:
-                        cur = tuple(shared_state["shuttles"][s_id]["pos"])
-                        output_pt = get_nearest(OUTPUT_POINTS, cur)
-                        others = [s["path"] for s in shared_state["shuttles"] if s["id"] != s_id]
-
-                    print(f"小车{s_id} (出库) -> 前往出库点 {output_pt}")
-                    path2 = improved_a_star_search(warehouse.grid_type, cur, output_pt, others)
+                    cur, others, obs = get_planning_params(OUTPUT_POINTS[0])
+                    output_pt = get_nearest(OUTPUT_POINTS, cur)
+                    print(f"小车{s_id} (出库) -> 出库点 {output_pt}")
+                    path2 = improved_a_star_search(warehouse.grid_type, cur, output_pt, others, obs)
 
                     if path2:
                         yield env.process(move_shuttle(env, s_id, path2))
-                        yield env.process(execute_op_sim(env, s_id, RETRIEVE_TIME, "出库点卸货"))
+                        yield env.process(execute_op_sim(env, s_id, RETRIEVE_TIME, "卸货"))
                         with state_lock: shared_state["shuttles"][s_id]["Load"] = False
                         success = True
 
-            # 3. 结算
             with state_lock:
                 shared_state["shuttles"][s_id]["busy"] = False
                 shared_state["shuttles"][s_id]["current_task"] = None
                 if success:
                     shared_state["completed_tasks"] += 1
-                    print(f"小车{s_id} 任务完成")
+                    # --- 更新：分别统计 ---
+                    if t_type == "release":
+                        shared_state["completed_release_tasks"] += 1
+                    else:
+                        shared_state["completed_pick_tasks"] += 1
+                    # --------------------
+                    print(f"小车{s_id} 完成")
                 else:
                     shared_state["failed_tasks"] += 1
-                    print(f"小车{s_id} 任务失败 (路径规划或状态错误)")
-                    # 失败任务回退
+                    print(f"小车{s_id} 失败")
                     if t_type == "pick":
                         shared_state["pick_tasks"].append(task)
                     else:
                         shared_state["release_tasks"].append(task)
 
         except Exception as e:
-            print(f"Controller Error: {e}")
+            print(f"Err: {e}")
             import traceback
             traceback.print_exc()
 
@@ -275,7 +251,6 @@ def run_sim():
     with state_lock:
         shared_state["simulation_started"] = True
     env = simpy.Environment()
-
     for i in range(SHUTTLES): env.process(controller(env, i))
     env.process(generate_tasks(env))
 
@@ -288,9 +263,8 @@ def run_sim():
 
     simulation_ready.set()
     while not visualization_started.is_set(): time.sleep(0.1)
-
     try:
-        env.run(until=600)
+        env.run(until=6000)
     finally:
         with state_lock:
             shared_state["done"] = True
