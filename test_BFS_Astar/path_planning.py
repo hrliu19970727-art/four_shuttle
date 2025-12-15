@@ -1,8 +1,10 @@
 # path_planning.py
 import heapq
 import random
+import collections
 from config import *
 
+# 论文参数: 路径拥堵系数
 ALPHA_M = 0.1
 
 
@@ -11,28 +13,21 @@ def manhattan_distance(pos1, pos2):
 
 
 def get_traffic_cost(pos, other_paths_sets, obstacles):
-    """
-    计算代价：
-    1. 拥堵代价 (0.1 * 占用数)
-    2. 障碍代价 (当前有车的位置代价 +100)
-    """
+    """A* 专用：计算拥堵代价"""
     cost = 1.0
-
-    # 1. 路径拥堵 (未来可能通过)
     occupancy = 0
     for path_set in other_paths_sets:
         if pos in path_set: occupancy += 1
     cost += (ALPHA_M * occupancy)
 
-    # 2. 当前障碍 (现在有车)
     if pos in obstacles:
-        cost += 100.0  # 极大的代价，迫使算法绕路
+        cost += 100.0
 
     return cost
 
 
 def get_valid_neighbors(grid_type, current, rows, cols):
-    """根据交通规则返回可行邻居"""
+    """通用邻居获取逻辑 (A* 和 BFS 共用)"""
     r, c = current
     g_type = grid_type[r][c]
     candidates = []
@@ -78,17 +73,13 @@ def get_valid_neighbors(grid_type, current, rows, cols):
 
 
 def improved_a_star_search(grid_type_map, start, goal, other_paths=None, obstacles=None):
-    """
-    带避障功能的 A*
-    :param obstacles: set or list of (r, c) - 当前其他小车的位置
-    """
+    """A* 算法 (考虑交通拥堵)"""
     if other_paths is None: other_paths = []
     other_paths_sets = [set(p) for p in other_paths]
-
     if obstacles is None:
         obstacles = set()
     else:
-        obstacles = set(obstacles)  # 转为集合加速查找
+        obstacles = set(obstacles)
 
     rows = len(grid_type_map)
     cols = len(grid_type_map[0])
@@ -113,7 +104,6 @@ def improved_a_star_search(grid_type_map, start, goal, other_paths=None, obstacl
         random.shuffle(neighbors)
 
         for neighbor in neighbors:
-            # 传入 obstacles 计算高昂代价
             move_cost = get_traffic_cost(neighbor, other_paths_sets, obstacles)
 
             n_type = grid_type_map[neighbor[0]][neighbor[1]]
@@ -127,6 +117,51 @@ def improved_a_star_search(grid_type_map, start, goal, other_paths=None, obstacl
                 h = manhattan_distance(neighbor, goal)
                 f_new = new_g + h
                 heapq.heappush(open_set, (f_new, new_g, neighbor, path + [neighbor]))
+
+    return []
+
+
+def bfs_search(grid_type_map, start, goal, other_paths=None, obstacles=None):
+    """
+    BFS 算法 (广度优先搜索)
+    特点：保证最短路径(步数最少)，但不考虑交通权重，且搜索范围是发散的
+    """
+    if obstacles is None:
+        obstacles = set()
+    else:
+        obstacles = set(obstacles)
+
+    rows = len(grid_type_map)
+    cols = len(grid_type_map[0])
+
+    if start == goal: return [start]
+
+    # 队列存储: (current_pos, path)
+    queue = collections.deque([(start, [start])])
+    visited = {start}
+
+    max_steps = 50000
+    steps = 0
+
+    while queue and steps < max_steps:
+        steps += 1
+        current, path = queue.popleft()
+
+        if current == goal:
+            return path
+
+        neighbors = get_valid_neighbors(grid_type_map, current, rows, cols)
+        # BFS 不需要随机shuffle，顺序遍历即可，或者shuffle增加随机性
+        random.shuffle(neighbors)
+
+        for neighbor in neighbors:
+            if neighbor not in visited:
+                # BFS 处理障碍：如果有车，视为不可通行 (硬约束)
+                if neighbor in obstacles:
+                    continue
+
+                visited.add(neighbor)
+                queue.append((neighbor, path + [neighbor]))
 
     return []
 

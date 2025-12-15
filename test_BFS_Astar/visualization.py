@@ -2,7 +2,7 @@
 import pygame
 import sys
 import math
-from config import ROWS, COLS, CELL_SIZE, COLORS
+from config import ROWS, COLS, CELL_SIZE, COLORS, PLANNING_ALGORITHM
 from map import warehouse
 from shared_state import shared_state, state_lock
 
@@ -73,7 +73,6 @@ def draw_battery_bar(surface, x, y, w, h, level):
 
 
 def draw_visual_aids(screen):
-    # 任务点
     for task in list(shared_state.get("release_tasks", [])):
         r, c = task.position
         cx, cy = c * CELL_SIZE + CELL_SIZE // 2, r * CELL_SIZE + CELL_SIZE // 2
@@ -85,7 +84,6 @@ def draw_visual_aids(screen):
         pygame.draw.circle(screen, COLOR_TASK_PICK, (cx, cy), 5)
         pygame.draw.circle(screen, (255, 255, 255), (cx, cy), 6, 1)
 
-    # 连线
     for s in shared_state.get("shuttles", []):
         if s.get("busy") and s.get("current_task"):
             sid = s["id"]
@@ -147,11 +145,20 @@ def draw_info_panel(screen):
     screen.blit(fs.render("SIMULATION TIME", True, COLOR_TEXT_DIM), (x_sys + 10, y + 55))
     screen.blit(fl.render(f"{current_time:.1f} s", True, COLOR_TEXT_MAIN), (x_sys + 10, y + 80))
 
-    status_txt = "RUNNING" if not shared_state.get("done") else "FINISHED"
-    status_col = COLOR_GOOD if not shared_state.get("done") else COLOR_BAD
-    pygame.draw.rect(screen, status_col, (x_sys, y + 125, 100, 24), border_radius=4)
-    stat_surf = get_font(14, True).render(status_txt, True, (30, 30, 30))
-    screen.blit(stat_surf, (x_sys + 50 - stat_surf.get_width() // 2, y + 130))
+    # --- 算法性能卡片 ---
+    # 计算平均值
+    total_time = shared_state.get("total_planning_time", 0)
+    count = shared_state.get("planning_count", 0)
+    total_len = shared_state.get("total_path_length", 0)
+    path_cnt = shared_state.get("path_count", 0)
+
+    avg_time = (total_time / count) if count > 0 else 0
+    avg_len = (total_len / path_cnt) if path_cnt > 0 else 0
+
+    y_perf = y + 125
+    screen.blit(fs.render(f"Algorithm: {PLANNING_ALGORITHM}", True, COLOR_HIGHLIGHT), (x_sys, y_perf))
+    screen.blit(fs.render(f"Avg Time: {avg_time:.2f} ms", True, COLOR_TEXT_MAIN), (x_sys, y_perf + 20))
+    screen.blit(fs.render(f"Avg Steps: {avg_len:.1f}", True, COLOR_TEXT_MAIN), (x_sys, y_perf + 40))
 
     # === 2. 车辆状态 ===
     x_shuttle = 220
@@ -179,7 +186,7 @@ def draw_info_panel(screen):
             task_col = COLOR_TASK_REL if is_load else COLOR_TASK_PICK
             pygame.draw.circle(screen, task_col, (cx + 130, cy + 15), 4)
 
-    # === 3. 统计仪表盘 (右侧) ===
+    # === 3. 统计仪表盘 ===
     x_stats = 700
     w_stats = TOTAL_WIDTH - x_stats - 20
     pygame.draw.rect(screen, (35, 37, 40), (x_stats, y, w_stats, 200), border_radius=10)
@@ -190,27 +197,23 @@ def draw_info_panel(screen):
     comp_pick = shared_state.get("completed_pick_tasks", 0)
     fail = shared_state.get("failed_tasks", 0)
 
-    # --- 左侧：两个大数字卡片 (入库/出库) ---
-    card_w = 120
-    card_h = 70
-
-    # 入库完成卡片
+    # 入库完成
     cx_rel = x_stats + 20
     cy_rel = y + 50
-    pygame.draw.rect(screen, (45, 50, 60), (cx_rel, cy_rel, card_w, card_h), border_radius=8)
-    pygame.draw.line(screen, COLOR_TASK_REL, (cx_rel, cy_rel + 10), (cx_rel, cy_rel + card_h - 10), 3)
+    pygame.draw.rect(screen, (45, 50, 60), (cx_rel, cy_rel, 120, 70), border_radius=8)
+    pygame.draw.line(screen, COLOR_TASK_REL, (cx_rel, cy_rel + 10), (cx_rel, cy_rel + 60), 3)
     screen.blit(get_font(36, True).render(str(comp_rel), True, COLOR_TEXT_MAIN), (cx_rel + 15, cy_rel + 5))
     screen.blit(fs.render("入库完成", True, COLOR_TEXT_DIM), (cx_rel + 15, cy_rel + 45))
 
-    # 出库完成卡片
+    # 出库完成
     cx_pick = x_stats + 20
     cy_pick = y + 130
-    pygame.draw.rect(screen, (45, 50, 60), (cx_pick, cy_pick, card_w, card_h), border_radius=8)
-    pygame.draw.line(screen, COLOR_TASK_PICK, (cx_pick, cy_pick + 10), (cx_pick, cy_pick + card_h - 10), 3)
+    pygame.draw.rect(screen, (45, 50, 60), (cx_pick, cy_pick, 120, 70), border_radius=8)
+    pygame.draw.line(screen, COLOR_TASK_PICK, (cx_pick, cy_pick + 10), (cx_pick, cy_pick + 60), 3)
     screen.blit(get_font(36, True).render(str(comp_pick), True, COLOR_TEXT_MAIN), (cx_pick + 15, cy_pick + 5))
     screen.blit(fs.render("出库完成", True, COLOR_TEXT_DIM), (cx_pick + 15, cy_pick + 45))
 
-    # --- 中间：其他指标列表 ---
+    # 指标列表
     lx = x_stats + 160
     ly = y + 50
     gap = 35
@@ -226,27 +229,24 @@ def draw_info_panel(screen):
     screen.blit(get_font(12).render("tasks/min", True, COLOR_TEXT_DIM),
                 (lx + 120 + t_surf.get_width() + 5, ly + gap + 5))
 
-    # --- 右侧：队列柱状微图 ---
+    # 队列微图
     q_rel = len(shared_state.get("release_tasks", []))
     q_pick = len(shared_state.get("pick_tasks", []))
     max_q = 10
 
     bx = x_stats + 320
     by = y + 50
-
     screen.blit(fs.render("In-Queue", True, COLOR_TEXT_DIM), (bx, by))
     bar_w = 80
     fill_rel = min(1.0, q_rel / max_q) * bar_w
     pygame.draw.rect(screen, (50, 50, 50), (bx, by + 20, bar_w, 8), border_radius=2)
-    if fill_rel > 0:
-        pygame.draw.rect(screen, COLOR_TASK_REL, (bx, by + 20, fill_rel, 8), border_radius=2)
+    if fill_rel > 0: pygame.draw.rect(screen, COLOR_TASK_REL, (bx, by + 20, fill_rel, 8), border_radius=2)
     screen.blit(fs.render(str(q_rel), True, COLOR_TEXT_MAIN), (bx + bar_w + 10, by + 15))
 
     screen.blit(fs.render("Out-Queue", True, COLOR_TEXT_DIM), (bx, by + 60))
     fill_pick = min(1.0, q_pick / max_q) * bar_w
     pygame.draw.rect(screen, (50, 50, 50), (bx, by + 80, bar_w, 8), border_radius=2)
-    if fill_pick > 0:
-        pygame.draw.rect(screen, COLOR_TASK_PICK, (bx, by + 80, fill_pick, 8), border_radius=2)
+    if fill_pick > 0: pygame.draw.rect(screen, COLOR_TASK_PICK, (bx, by + 80, fill_pick, 8), border_radius=2)
     screen.blit(fs.render(str(q_pick), True, COLOR_TEXT_MAIN), (bx + bar_w + 10, by + 75))
 
 
@@ -254,7 +254,7 @@ def run_visualization():
     try:
         pygame.init()
         screen = pygame.display.set_mode((TOTAL_WIDTH, TOTAL_HEIGHT))
-        pygame.display.set_caption("智能仓库调度系统 V7.0")
+        pygame.display.set_caption("智能仓库调度系统 V8.0 (算法对比版)")
         clock = pygame.time.Clock()
 
         while True:

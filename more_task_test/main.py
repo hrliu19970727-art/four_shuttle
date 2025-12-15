@@ -6,14 +6,15 @@ import random
 import numpy as np
 import logging
 from map import warehouse
-from path_planning import improved_a_star_search, is_valid_position, manhattan_distance
+# 引入两个算法
+from path_planning import improved_a_star_search, bfs_search, is_valid_position, manhattan_distance
 from scheduling import Task
 from visualization import run_visualization
 from config import *
 from shared_state import shared_state, state_lock
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
-SIMULATION_DELAY = 0.0001
+SIMULATION_DELAY = 0.05
 simulation_ready = threading.Event()
 visualization_started = threading.Event()
 
@@ -61,47 +62,97 @@ def initialize_shared_state():
         shared_state["pick_tasks"] = []
         shared_state["completed_tasks"] = 0
         shared_state["failed_tasks"] = 0
-        shared_state["completed_release_tasks"] = 0  # 新增初始化
-        shared_state["completed_pick_tasks"] = 0  # 新增初始化
+        shared_state["completed_release_tasks"] = 0
+        shared_state["completed_pick_tasks"] = 0
+        # 初始化性能统计
+        shared_state["total_planning_time"] = 0.0
+        shared_state["planning_count"] = 0
+        shared_state["total_path_length"] = 0
+        shared_state["path_count"] = 0
+
         shared_state["time"] = 0
         shared_state["done"] = False
-        print(f"初始化完成: {SHUTTLES}辆小车")
+        print(f"初始化完成: {SHUTTLES}辆小车, 算法: {PLANNING_ALGORITHM}")
 
 
 def generate_tasks(env):
-    print("任务生成器启动")
+    """
+    【高负载版】任务生成器
+    用于压力测试算法性能
+    """
+    print(">>> 高负载任务生成器启动 (High Load Mode)")
+
+    # 初始爆发：一开始就生成一批任务，让小车动起来
+    yield env.timeout(1)
+    with state_lock:
+        print("--- 生成初始波任务 ---")
+        # 初始填充 10 个任务
+        for _ in range(10):
+            # (复用下方的生成逻辑，这里简化处理，依靠循环即可)
+            pass
+
     while not shared_state["done"]:
-        yield env.timeout(random.randint(5, 15))
+        # 1. 极短的生成间隔 (0.5 ~ 2秒)
+        yield env.timeout(random.uniform(0.5, 2.0))
+
         if shared_state["done"]: break
+
         with state_lock:
+            # 统计空闲和占用货位
             empties = []
             filled = []
             for r in range(ROWS):
                 for c in range(COLS):
                     if warehouse.grid_type[r][c] == TYPE_STORAGE:
-                        if shared_state["slots"][r][c] == 1:
+                        slot_status = shared_state["slots"][r][c]
+                        if slot_status == 1:
                             empties.append((r, c))
-                        elif shared_state["slots"][r][c] == 2:
+                        elif slot_status == 2:
                             filled.append((r, c))
 
+            # 过滤掉已经是任务目标的点
             active_pos = set()
-            for t in shared_state["release_tasks"] + shared_state["pick_tasks"]: active_pos.add(t.position)
+            for t in shared_state["release_tasks"] + shared_state["pick_tasks"]:
+                active_pos.add(t.position)
             for s in shared_state["shuttles"]:
                 if s["current_task"]: active_pos.add(s["current_task"].position)
 
             empties = [p for p in empties if p not in active_pos]
             filled = [p for p in filled if p not in active_pos]
 
-            cnt = len(shared_state["release_tasks"]) + len(shared_state["pick_tasks"])
-            if cnt < 6:
-                if empties and random.random() < 0.6:
-                    pos = random.choice(empties)
-                    shared_state["release_tasks"].append(Task(0, pos, "release"))
-                    print(f"新入库任务: 目标{pos}")
-                elif filled:
-                    pos = random.choice(filled)
-                    shared_state["pick_tasks"].append(Task(0, pos, "pick"))
-                    print(f"新出库任务: 来源{pos}")
+            current_task_count = len(shared_state["release_tasks"]) + len(shared_state["pick_tasks"])
+
+            # 2. 提高队列上限 (例如允许积压 50 个任务)
+            if current_task_count < 50:
+
+                # 3. 批量生成 (每次随机生成 1-3 个任务)
+                batch_size = random.randint(1, 3)
+
+                for _ in range(batch_size):
+                    # 重新检查剩余可用位置 (防止一波生成把位置耗尽报错)
+                    if not empties and not filled: break
+
+                    # 随机逻辑：70%概率生成入库(填满仓库)，30%出库
+                    # 或者如果空位很少，强制出库；货很少，强制入库
+                    is_release = False
+
+                    if not filled:
+                        is_release = True
+                    elif not empties:
+                        is_release = False
+                    else:
+                        is_release = (random.random() < 0.7)
+
+                    if is_release and empties:
+                        pos = random.choice(empties)
+                        shared_state["release_tasks"].append(Task(0, pos, "release"))
+                        empties.remove(pos)  # 避免同批次重复
+                        print(f"[压力测试] 新增入库 -> {pos}")
+                    elif not is_release and filled:
+                        pos = random.choice(filled)
+                        shared_state["pick_tasks"].append(Task(0, pos, "pick"))
+                        filled.remove(pos)
+                        print(f"[压力测试] 新增出库 -> {pos}")
 
 
 def move_shuttle(env, s_id, path):
@@ -132,6 +183,32 @@ def execute_op_sim(env, s_id, duration, status_text):
         shared_state["shuttles"][s_id]["status"] = status_text
     yield env.timeout(duration)
     if SIMULATION_DELAY: time.sleep(SIMULATION_DELAY * 2)
+
+
+def run_path_planning(start, end, others, obstacles):
+    """
+    【核心修改】统一的路径规划入口，包含计时和统计
+    """
+    t_start = time.perf_counter()
+
+    path = []
+    if PLANNING_ALGORITHM == "BFS":
+        path = bfs_search(warehouse.grid_type, start, end, others, obstacles)
+    else:  # Default A*
+        path = improved_a_star_search(warehouse.grid_type, start, end, others, obstacles)
+
+    t_end = time.perf_counter()
+    duration = (t_end - t_start) * 1000  # 转毫秒
+
+    # 更新统计数据
+    with state_lock:
+        shared_state["total_planning_time"] += duration
+        shared_state["planning_count"] += 1
+        if path:
+            shared_state["total_path_length"] += len(path)
+            shared_state["path_count"] += 1
+
+    return path
 
 
 def controller(env, s_id):
@@ -174,7 +251,8 @@ def controller(env, s_id):
                 cur, others, obs = get_planning_params(INPUT_POINTS[0])
                 input_pt = get_nearest(INPUT_POINTS, cur)
                 print(f"小车{s_id} (入库) -> 入库点 {input_pt}")
-                path1 = improved_a_star_search(warehouse.grid_type, cur, input_pt, others, obs)
+
+                path1 = run_path_planning(cur, input_pt, others, obs)
 
                 if path1:
                     yield env.process(move_shuttle(env, s_id, path1))
@@ -184,7 +262,7 @@ def controller(env, s_id):
 
                     cur, others, obs = get_planning_params(task.position)
                     print(f"小车{s_id} (入库) -> 货位 {task.position}")
-                    path2 = improved_a_star_search(warehouse.grid_type, cur, task.position, others, obs)
+                    path2 = run_path_planning(cur, task.position, others, obs)
 
                     if path2:
                         yield env.process(move_shuttle(env, s_id, path2))
@@ -199,7 +277,7 @@ def controller(env, s_id):
             elif t_type == "pick":
                 cur, others, obs = get_planning_params(task.position)
                 print(f"小车{s_id} (出库) -> 货位 {task.position}")
-                path1 = improved_a_star_search(warehouse.grid_type, cur, task.position, others, obs)
+                path1 = run_path_planning(cur, task.position, others, obs)
 
                 if path1:
                     yield env.process(move_shuttle(env, s_id, path1))
@@ -213,7 +291,7 @@ def controller(env, s_id):
                     cur, others, obs = get_planning_params(OUTPUT_POINTS[0])
                     output_pt = get_nearest(OUTPUT_POINTS, cur)
                     print(f"小车{s_id} (出库) -> 出库点 {output_pt}")
-                    path2 = improved_a_star_search(warehouse.grid_type, cur, output_pt, others, obs)
+                    path2 = run_path_planning(cur, output_pt, others, obs)
 
                     if path2:
                         yield env.process(move_shuttle(env, s_id, path2))
@@ -226,12 +304,10 @@ def controller(env, s_id):
                 shared_state["shuttles"][s_id]["current_task"] = None
                 if success:
                     shared_state["completed_tasks"] += 1
-                    # --- 更新：分别统计 ---
                     if t_type == "release":
                         shared_state["completed_release_tasks"] += 1
                     else:
                         shared_state["completed_pick_tasks"] += 1
-                    # --------------------
                     print(f"小车{s_id} 完成")
                 else:
                     shared_state["failed_tasks"] += 1
@@ -264,7 +340,7 @@ def run_sim():
     simulation_ready.set()
     while not visualization_started.is_set(): time.sleep(0.1)
     try:
-        env.run(until=3600)
+        env.run(until=600)
     finally:
         with state_lock:
             shared_state["done"] = True

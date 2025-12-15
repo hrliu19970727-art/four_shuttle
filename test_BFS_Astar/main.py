@@ -6,14 +6,15 @@ import random
 import numpy as np
 import logging
 from map import warehouse
-from path_planning import improved_a_star_search, is_valid_position, manhattan_distance
+# 引入两个算法
+from path_planning import improved_a_star_search, bfs_search, is_valid_position, manhattan_distance
 from scheduling import Task
 from visualization import run_visualization
 from config import *
 from shared_state import shared_state, state_lock
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
-SIMULATION_DELAY = 0.0001
+SIMULATION_DELAY = 0.001
 simulation_ready = threading.Event()
 visualization_started = threading.Event()
 
@@ -61,11 +62,17 @@ def initialize_shared_state():
         shared_state["pick_tasks"] = []
         shared_state["completed_tasks"] = 0
         shared_state["failed_tasks"] = 0
-        shared_state["completed_release_tasks"] = 0  # 新增初始化
-        shared_state["completed_pick_tasks"] = 0  # 新增初始化
+        shared_state["completed_release_tasks"] = 0
+        shared_state["completed_pick_tasks"] = 0
+        # 初始化性能统计
+        shared_state["total_planning_time"] = 0.0
+        shared_state["planning_count"] = 0
+        shared_state["total_path_length"] = 0
+        shared_state["path_count"] = 0
+
         shared_state["time"] = 0
         shared_state["done"] = False
-        print(f"初始化完成: {SHUTTLES}辆小车")
+        print(f"初始化完成: {SHUTTLES}辆小车, 算法: {PLANNING_ALGORITHM}")
 
 
 def generate_tasks(env):
@@ -134,6 +141,32 @@ def execute_op_sim(env, s_id, duration, status_text):
     if SIMULATION_DELAY: time.sleep(SIMULATION_DELAY * 2)
 
 
+def run_path_planning(start, end, others, obstacles):
+    """
+    【核心修改】统一的路径规划入口，包含计时和统计
+    """
+    t_start = time.perf_counter()
+
+    path = []
+    if PLANNING_ALGORITHM == "BFS":
+        path = bfs_search(warehouse.grid_type, start, end, others, obstacles)
+    else:  # Default A*
+        path = improved_a_star_search(warehouse.grid_type, start, end, others, obstacles)
+
+    t_end = time.perf_counter()
+    duration = (t_end - t_start) * 1000  # 转毫秒
+
+    # 更新统计数据
+    with state_lock:
+        shared_state["total_planning_time"] += duration
+        shared_state["planning_count"] += 1
+        if path:
+            shared_state["total_path_length"] += len(path)
+            shared_state["path_count"] += 1
+
+    return path
+
+
 def controller(env, s_id):
     yield env.timeout(random.random())
 
@@ -174,7 +207,8 @@ def controller(env, s_id):
                 cur, others, obs = get_planning_params(INPUT_POINTS[0])
                 input_pt = get_nearest(INPUT_POINTS, cur)
                 print(f"小车{s_id} (入库) -> 入库点 {input_pt}")
-                path1 = improved_a_star_search(warehouse.grid_type, cur, input_pt, others, obs)
+
+                path1 = run_path_planning(cur, input_pt, others, obs)
 
                 if path1:
                     yield env.process(move_shuttle(env, s_id, path1))
@@ -184,7 +218,7 @@ def controller(env, s_id):
 
                     cur, others, obs = get_planning_params(task.position)
                     print(f"小车{s_id} (入库) -> 货位 {task.position}")
-                    path2 = improved_a_star_search(warehouse.grid_type, cur, task.position, others, obs)
+                    path2 = run_path_planning(cur, task.position, others, obs)
 
                     if path2:
                         yield env.process(move_shuttle(env, s_id, path2))
@@ -199,7 +233,7 @@ def controller(env, s_id):
             elif t_type == "pick":
                 cur, others, obs = get_planning_params(task.position)
                 print(f"小车{s_id} (出库) -> 货位 {task.position}")
-                path1 = improved_a_star_search(warehouse.grid_type, cur, task.position, others, obs)
+                path1 = run_path_planning(cur, task.position, others, obs)
 
                 if path1:
                     yield env.process(move_shuttle(env, s_id, path1))
@@ -213,7 +247,7 @@ def controller(env, s_id):
                     cur, others, obs = get_planning_params(OUTPUT_POINTS[0])
                     output_pt = get_nearest(OUTPUT_POINTS, cur)
                     print(f"小车{s_id} (出库) -> 出库点 {output_pt}")
-                    path2 = improved_a_star_search(warehouse.grid_type, cur, output_pt, others, obs)
+                    path2 = run_path_planning(cur, output_pt, others, obs)
 
                     if path2:
                         yield env.process(move_shuttle(env, s_id, path2))
@@ -226,12 +260,10 @@ def controller(env, s_id):
                 shared_state["shuttles"][s_id]["current_task"] = None
                 if success:
                     shared_state["completed_tasks"] += 1
-                    # --- 更新：分别统计 ---
                     if t_type == "release":
                         shared_state["completed_release_tasks"] += 1
                     else:
                         shared_state["completed_pick_tasks"] += 1
-                    # --------------------
                     print(f"小车{s_id} 完成")
                 else:
                     shared_state["failed_tasks"] += 1
@@ -264,7 +296,7 @@ def run_sim():
     simulation_ready.set()
     while not visualization_started.is_set(): time.sleep(0.1)
     try:
-        env.run(until=6000)
+        env.run(until=3600)
     finally:
         with state_lock:
             shared_state["done"] = True
