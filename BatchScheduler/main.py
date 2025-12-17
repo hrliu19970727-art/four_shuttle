@@ -20,6 +20,7 @@ try:
 except ImportError:
     print("未找到 idqn_agent.py 或 torch，将回退到默认逻辑。")
     DRL_ENABLED = False
+    MAX_OBSERVED_TASKS = 10  # Fallback definition
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
 SIMULATION_DELAY = 0.005  # 加快仿真速度以便快速看完一波任务
@@ -30,22 +31,29 @@ INPUT_POINTS = [(ROWS - 13, 8 - 1), (ROWS - 20, 6 - 1)]
 OUTPUT_POINTS = [(ROWS - 14, 47 - 1), (ROWS - 20, 49 - 1)]
 
 # --- 工业场景配置 ---
-WAVE_SIZE = 40  # 本次作业波次的总任务数 (例如 40 个任务)
-TASK_QUEUE_LIMIT = 10  # 下发队列限制 (避免一次性把所有任务都塞给小车)
+WAVE_SIZE = 100  # 本次作业波次的总任务数
+TASK_QUEUE_LIMIT = 10  # 下发队列限制
 
 if DRL_ENABLED:
     global_agent = IDQNAgent()
 
 
 def get_nearest(points, current_pos):
-    best_p = points[0]
+    """
+    获取最近的点，如果距离相同则随机选择，以实现负载均衡
+    """
+    best_points = []
     min_dist = float('inf')
+
     for p in points:
         d = manhattan_distance(current_pos, p)
         if d < min_dist:
             min_dist = d
-            best_p = p
-    return best_p
+            best_points = [p]
+        elif d == min_dist:
+            best_points.append(p)
+
+    return random.choice(best_points)
 
 
 def is_occupied(pos, my_id):
@@ -92,17 +100,12 @@ def initialize_shared_state():
 class BatchScheduler:
     def __init__(self, wave_size):
         self.total_tasks = wave_size
-        self.pending_tasks = []  # 待下发的静态任务池
-        self.generated_count = 0
+        self.pending_tasks = []
         self._prepare_static_wave()
 
     def _prepare_static_wave(self):
-        """
-        在仿真开始前，生成一张固定的任务清单 (模拟 WMS 订单池)
-        """
         print(f">>> 正在生成静态作业波次 (共 {self.total_tasks} 单)...")
         with state_lock:
-            # 获取当前所有空位和货位
             empties = []
             filled = []
             for r in range(ROWS):
@@ -114,27 +117,17 @@ class BatchScheduler:
                         elif st == 2:
                             filled.append((r, c))
 
-            # 随机打乱以模拟真实分布
             random.shuffle(empties)
             random.shuffle(filled)
 
-            for _ in range(self.total_tasks):
-                # 简单逻辑：有货就出库，没货就入库，保持动态平衡
-                # 实际工业中可能是 50% 入 50% 出
-                is_release = False
+            for i in range(self.total_tasks):
                 if filled and (not empties or random.random() < 0.5):
-                    # 生成出库任务
                     pos = filled.pop(0)
-                    t = Task(0, pos, "pick")
+                    t = Task(i, pos, "pick")
                     self.pending_tasks.append(t)
-                    # 预占位：为了防止后续任务重复生成同一位置，
-                    # 在静态生成阶段我们就假设它被处理了，但这只是逻辑上的，
-                    # 实际 shared_state["slots"] 还是原样，等小车去处理。
-                    # 这里为了简单，我们仅从临时列表中移除。
                 elif empties:
-                    # 生成入库任务
                     pos = empties.pop(0)
-                    t = Task(0, pos, "release")
+                    t = Task(i, pos, "release")
                     self.pending_tasks.append(t)
 
         print(f">>> 静态波次生成完毕: {len(self.pending_tasks)} 个任务待执行")
@@ -148,35 +141,24 @@ class BatchScheduler:
         return None
 
 
-# 全局调度器实例
 batch_scheduler = None
 
 
 def generate_tasks(env):
-    """
-    负责将静态池中的任务“喂”给系统
-    """
     global batch_scheduler
     batch_scheduler = BatchScheduler(WAVE_SIZE)
 
     print(">>> 任务分发器启动 (静态波次模式)")
-    yield env.timeout(1)  # 启动缓冲
+    yield env.timeout(1)
 
     while not shared_state["done"]:
-        # 检查是否还有任务没发完
         if not batch_scheduler.has_pending_tasks():
-            # 任务全部发完了，但这不代表做完了，只需停止生成即可
-            # 等待所有任务完成的逻辑在 monitor 中
             yield env.timeout(1)
             continue
 
         with state_lock:
-            # 检查当前积压情况
             current_backlog = len(shared_state["release_tasks"]) + len(shared_state["pick_tasks"])
-
-            # 如果系统有空闲处理能力，就下发新任务
             if current_backlog < TASK_QUEUE_LIMIT:
-                # 每次下发 1-2 个，模拟订单到达节奏
                 for _ in range(min(2, len(batch_scheduler.pending_tasks))):
                     task = batch_scheduler.pop_task()
                     if task:
@@ -186,24 +168,28 @@ def generate_tasks(env):
                         else:
                             shared_state["pick_tasks"].append(task)
                             print(f"[WCS下发] 出库任务 -> {task.position} (剩余: {len(batch_scheduler.pending_tasks)})")
-
                     if current_backlog >= TASK_QUEUE_LIMIT: break
 
-        # 发单间隔
         yield env.timeout(random.uniform(0.5, 1.5))
 
 
 def move_shuttle(env, s_id, path):
     if not path: return True
-    start_idx = 1 if path[0] == tuple(shared_state["shuttles"][s_id]["pos"]) else 0
+    # 如果路径起点就是当前位置，从下一个点开始
+    start_idx = 1 if len(path) > 0 and path[0] == tuple(shared_state["shuttles"][s_id]["pos"]) else 0
     actual_path = path[start_idx:]
+
+    if not actual_path:
+        return True
 
     for i, step in enumerate(actual_path):
         wait_time = 0
         while True:
+            # 简单的非原子性检查，减少锁争用
             if not is_occupied(step, s_id):
                 move_success = False
                 with state_lock:
+                    # 原子性再次检查并移动
                     if not is_occupied(step, s_id):
                         shared_state["shuttles"][s_id]["pos"] = list(step)
                         shared_state["shuttles"][s_id]["path"] = actual_path[i:]
@@ -214,7 +200,7 @@ def move_shuttle(env, s_id, path):
 
             yield env.timeout(0.5)
             wait_time += 0.5
-            if wait_time > 3.0: return False  # 超时判死锁
+            if wait_time > 5.0: return False  # 超时判死锁/拥堵
 
         yield env.timeout(MOVE_TIME)
         if SIMULATION_DELAY: time.sleep(SIMULATION_DELAY)
@@ -261,6 +247,7 @@ def get_planning_params(s_id):
         for s in shared_state["shuttles"]:
             if s["id"] == s_id: continue
             other_pos = tuple(s["pos"])
+            # 将其他小车的当前位置视为未来一段时间的动态障碍，防止碰撞
             for t in range(20): obs.add((other_pos[0], other_pos[1], t))
             if s["path"]:
                 for t, p in enumerate(s["path"]):
@@ -270,19 +257,30 @@ def get_planning_params(s_id):
 
 
 def robust_move(env, s_id, target_pos):
-    max_retries = 5
+    """
+    尝试多次规划路径并移动。如果失败返回 False。
+    """
+    max_retries = 3
     for attempt in range(max_retries):
         cur, others, obs = get_planning_params(s_id)
+
+        # 如果已经在目标点，直接成功
+        if cur == target_pos:
+            return True
+
         path = run_path_planning(s_id, cur, target_pos, others, obs)
 
         if not path:
-            yield env.timeout(1.0)
+            # 寻路失败，稍作等待后重试
+            yield env.timeout(0.5)
             continue
 
         success = yield env.process(move_shuttle(env, s_id, path))
         if success:
             return True
         else:
+            # 移动过程中遇到堵塞超时
+            yield env.timeout(0.5)
             continue
 
     return False
@@ -308,7 +306,8 @@ def construct_state(s_id, available_tasks):
 
 
 def controller(env, s_id, input_locks, output_locks):
-    yield env.timeout(random.random())
+    # 错峰启动
+    yield env.timeout(random.uniform(0, 2))
 
     while True:
         with state_lock:
@@ -319,9 +318,11 @@ def controller(env, s_id, input_locks, output_locks):
         task_idx = -1
         t_type = None
         state_vec = None
+        action_idx = 0
 
         with state_lock:
             candidates = shared_state["pick_tasks"] + shared_state["release_tasks"]
+            # 过滤掉已经被其他小车锁定的任务（简单处理，实际可加任务状态锁）
             candidates = candidates[:MAX_OBSERVED_TASKS]
 
         if not candidates:
@@ -329,7 +330,6 @@ def controller(env, s_id, input_locks, output_locks):
             yield env.timeout(1)
             continue
 
-        action_idx = 0
         if DRL_ENABLED:
             state_vec = construct_state(s_id, candidates)
             valid_actions = list(range(len(candidates)))
@@ -337,49 +337,44 @@ def controller(env, s_id, input_locks, output_locks):
 
             if action_idx < len(candidates):
                 task = candidates[action_idx]
-                with state_lock:
-                    if task in shared_state["pick_tasks"]:
-                        shared_state["pick_tasks"].remove(task)
-                        t_type = "pick"
-                    elif task in shared_state["release_tasks"]:
-                        shared_state["release_tasks"].remove(task)
-                        t_type = "release"
             else:
                 task = candidates[0]
-                with state_lock:
-                    if task in shared_state["pick_tasks"]:
-                        shared_state["pick_tasks"].pop(0)
-                        t_type = "pick"
-                    elif task in shared_state["release_tasks"]:
-                        shared_state["release_tasks"].pop(0)
-                        t_type = "release"
         else:
-            with state_lock:
-                if shared_state["pick_tasks"]:
-                    task = shared_state["pick_tasks"].pop(0)
-                    t_type = "pick"
-                elif shared_state["release_tasks"]:
-                    task = shared_state["release_tasks"].pop(0)
-                    t_type = "release"
+            task = candidates[0]
+
+        # 尝试从队列中移除任务
+        task_acquired = False
+        with state_lock:
+            if task in shared_state["pick_tasks"]:
+                shared_state["pick_tasks"].remove(task)
+                t_type = "pick"
+                task_acquired = True
+            elif task in shared_state["release_tasks"]:
+                shared_state["release_tasks"].remove(task)
+                t_type = "release"
+                task_acquired = True
+
+        if not task_acquired:
+            yield env.timeout(0.1)
+            continue
 
         start_time = env.now
+        with state_lock:
+            shared_state["shuttles"][s_id]["busy"] = True
+            shared_state["shuttles"][s_id]["current_task"] = task
+
+        success = False
+
         try:
-            with state_lock:
-                shared_state["shuttles"][s_id]["busy"] = True
-                shared_state["shuttles"][s_id]["current_task"] = task
-
-            success = False
-
             # === 入库流程 ===
             if t_type == "release":
                 cur, _, _ = get_planning_params(s_id)
                 target_port = get_nearest(INPUT_POINTS, cur)
 
-                print(f"小车{s_id} (DRL) 选定入库 -> 请求锁...")
+                print(f"小车{s_id} (DRL) 选定入库 {task.position} -> 请求锁...")
                 with input_locks[target_port].request() as req:
                     yield req
-                    # 1. 拿到锁，使用 robust_move 前往入库点
-                    # 【关键修复】拆分为两行，避免 SyntaxError
+                    # 1. 前往入库点
                     reached_port = yield env.process(robust_move(env, s_id, target_port))
 
                     if reached_port:
@@ -388,10 +383,7 @@ def controller(env, s_id, input_locks, output_locks):
                             shared_state["shuttles"][s_id]["Load"] = True
 
                         # 2. 前往货位
-                        cur, _, _ = get_planning_params(s_id)
-                        # 【关键修复】拆分为两行
                         reached_slot = yield env.process(robust_move(env, s_id, task.position))
-
                         if reached_slot:
                             success = True
 
@@ -406,7 +398,6 @@ def controller(env, s_id, input_locks, output_locks):
             # === 出库流程 ===
             elif t_type == "pick":
                 # 1. 去货位
-                # 【关键修复】拆分为两行
                 reached_slot = yield env.process(robust_move(env, s_id, task.position))
 
                 if reached_slot:
@@ -420,9 +411,9 @@ def controller(env, s_id, input_locks, output_locks):
                     # 2. 去出库点
                     cur, _, _ = get_planning_params(s_id)
                     target_port = get_nearest(OUTPUT_POINTS, cur)
+
                     with output_locks[target_port].request() as req:
                         yield req
-                        # 【关键修复】拆分为两行
                         reached_port = yield env.process(robust_move(env, s_id, target_port))
 
                         if reached_port:
@@ -431,11 +422,13 @@ def controller(env, s_id, input_locks, output_locks):
                                 shared_state["shuttles"][s_id]["Load"] = False
                             success = True
 
-                            # 必须驶离
+                            # === 关键修复：强制等待驶离 ===
+                            # 必须驶离出库点，否则下一辆车无法进入
                             yield env.timeout(0.5)
                             rest_pos = None
                             with state_lock:
                                 cur = tuple(shared_state["shuttles"][s_id]["pos"])
+                                # 搜索附近的一个空闲位作为临时停靠点
                                 for dr in range(-5, 6):
                                     for dc in range(-5, 6):
                                         nr, nc = cur[0] + dr, cur[1] + dc
@@ -444,10 +437,12 @@ def controller(env, s_id, input_locks, output_locks):
                                             rest_pos = (nr, nc)
                                             break
                                     if rest_pos: break
-                            if rest_pos:
-                                env.process(robust_move(env, s_id, rest_pos))
 
-            # --- DRL 训练与结算 ---
+                            if rest_pos:
+                                # 必须 yield 等待移动完成！否则会释放锁，导致下一辆车寻路失败（以为这里没人）
+                                yield env.process(robust_move(env, s_id, rest_pos))
+
+            # --- 结果处理与训练 ---
             end_time = env.now
             reward = -(end_time - start_time)
 
@@ -462,26 +457,40 @@ def controller(env, s_id, input_locks, output_locks):
             with state_lock:
                 shared_state["shuttles"][s_id]["busy"] = False
                 shared_state["shuttles"][s_id]["current_task"] = None
-                if success:
+
+            if success:
+                with state_lock:
                     shared_state["completed_tasks"] += 1
                     if t_type == "release":
                         shared_state["completed_release_tasks"] += 1
                     else:
                         shared_state["completed_pick_tasks"] += 1
-                    print(f"小车{s_id} 完成 (Reward: {reward:.1f})")
-                else:
+                print(f"小车{s_id} 完成 {t_type} (Reward: {reward:.1f})")
+            else:
+                # 失败处理：增加随机退避，防止死锁循环
+                with state_lock:
                     shared_state["failed_tasks"] += 1
-                    if DRL_ENABLED: global_agent.store_transition(state_vec, action_idx, -200, state_vec)
                     # 归还任务
                     if t_type == "pick":
                         shared_state["pick_tasks"].append(task)
                     elif t_type == "release":
                         shared_state["release_tasks"].append(task)
 
+                if DRL_ENABLED:
+                    global_agent.store_transition(state_vec, action_idx, -200, state_vec)
+
+                print(f"小车{s_id} 任务失败，随机退避...")
+                yield env.timeout(random.uniform(2.0, 5.0))
+
         except Exception as e:
-            print(f"Err: {e}")
+            print(f"Err in controller {s_id}: {e}")
             import traceback
             traceback.print_exc()
+            # 出错也要释放
+            with state_lock:
+                shared_state["shuttles"][s_id]["busy"] = False
+
+
 def run_sim():
     with state_lock:
         shared_state["simulation_started"] = True
@@ -499,28 +508,22 @@ def run_sim():
         while not shared_state["done"]:
             with state_lock:
                 shared_state["time"] = env.now
-                # 【关键】检查是否所有任务都完成了
                 completed = shared_state["completed_tasks"]
-                # 注意：失败的任务会回退，所以总量守恒
-                # 如果 待下发=0 且 队列=0 且 所有车不忙，说明做完了？
-                # 简单点：直接看 completed 是否达到 WAVE_SIZE
-                # (考虑到可能有极少数永久失败死锁，可以加个超时)
                 if completed >= WAVE_SIZE:
                     print(f"\n====== 波次完成! 耗时: {env.now:.2f}s ======")
                     shared_state["done"] = True
-
             yield env.timeout(0.5)
 
     env.process(monitor())
 
     simulation_ready.set()
-    while not visualization_started.is_set(): time.sleep(0.1)
+    # 等待可视化启动
+    # 注意：如果没有 GUI 环境，这里可能会卡住，可根据情况注释掉
+    # while not visualization_started.is_set(): time.sleep(0.1)
 
-    # 运行直到 done 标志被置位，或者设置一个超长保底时间
-    # 这里的 until 是 SimPy 的时间单位，不是秒
     while not shared_state["done"]:
         try:
-            env.run(until=env.now + 10)  # 步进运行
+            env.run(until=env.now + 10)
         except Exception:
             break
 

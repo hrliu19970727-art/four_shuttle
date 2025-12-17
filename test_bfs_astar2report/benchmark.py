@@ -7,7 +7,7 @@ import pandas as pd
 def main():
     # 1. 初始化波次：生成 50 个任务
     # 这些任务会被保存下来，分别传给不同的算法，确保测试条件一致
-    scheduler = BatchScheduler(wave_size=50)
+    scheduler = BatchScheduler(wave_size=100)
 
     results = []
 

@@ -6,7 +6,7 @@ import pandas as pd
 
 def main():
     # 1. 生成 50 个固定任务
-    scheduler = BatchScheduler(wave_size=50)
+    scheduler = BatchScheduler(wave_size=10)
 
     results = []
 

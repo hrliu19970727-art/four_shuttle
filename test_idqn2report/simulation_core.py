@@ -1,4 +1,4 @@
-# test_standastar2report/simulation_core.py
+# simulation_core.py
 import simpy
 import threading
 import time
@@ -33,7 +33,7 @@ except ImportError:
     DRL_ENABLED = False
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
-SIMULATION_DELAY = 0.001
+SIMULATION_DELAY = 0.0001
 simulation_ready = threading.Event()
 visualization_started = threading.Event()
 
@@ -108,21 +108,17 @@ def run_path_planning(s_id, start, end, others, obstacles, algorithm):
         current_slots = np.array(shared_state["slots"])
         is_loaded = shared_state["shuttles"][s_id]["Load"]
 
-    # 1. 普通 A* (现在支持时空避障)
     if algorithm == "STANDARD_A*":
         if standard_a_star_search:
+            # 传入 reservations (obstacles) 以启用时空避障
             path = standard_a_star_search(
-                warehouse.grid_type,
-                start,
-                end,
-                slots_map=current_slots,
-                is_loaded=is_loaded,
-                reservations=obstacles  # 【关键修改】传入动态障碍，启用分时复用
+                warehouse.grid_type, start, end,
+                slots_map=current_slots, is_loaded=is_loaded,
+                reservations=obstacles
             )
         else:
             print("Error: standard_a_star_search not imported")
 
-    # 2. 改进 A* (Ours) / IDQN
     elif algorithm == "IMPROVED_A*" or algorithm == "IDQN":
         path = improved_a_star_search(
             warehouse.grid_type, start, end,
@@ -174,19 +170,15 @@ def robust_move(env, s_id, target_pos, algorithm):
     max_retries = 5
     for attempt in range(max_retries):
         cur, others, obs = get_planning_params(s_id)
-
         path = run_path_planning(s_id, cur, target_pos, others, obs, algorithm)
-
         if not path:
             yield env.timeout(1.0)
             continue
-
         success = yield env.process(move_shuttle(env, s_id, path))
         if success:
             return True
         else:
             continue
-
     return False
 
 
@@ -209,19 +201,26 @@ def construct_state(s_id, available_tasks):
 
 
 def task_dispatcher(env, task_list):
+    """
+    【修正版】确保任务全部真正“完成”才结束，忽略失败计数
+    """
     print(f">>> [Core] 任务分发器启动，共 {len(task_list)} 个任务待执行")
     yield env.timeout(1)
     queue_limit = 20
 
-    while task_list or len(shared_state["release_tasks"]) + len(shared_state["pick_tasks"]) > 0:
+    # 只要没标记 done，就一直循环监控
+    while not shared_state["done"]:
         with state_lock:
-            total_processed = shared_state["completed_tasks"] + shared_state["failed_tasks"]
-            if not task_list and total_processed >= TOTAL_TASKS_COUNT_GLOBAL:
+            # === 关键修改 ===
+            # 只有当【成功完成】的数量达到总目标时，才算结束
+            # 失败的任务会被放回队列重试，不应计入总进度
+            if shared_state["completed_tasks"] >= TOTAL_TASKS_COUNT_GLOBAL:
                 shared_state["done"] = True
-                break
+                break  # 全部完成
 
+            # 2. 分发任务 (如果还有待分发任务)
             current_backlog = len(shared_state["release_tasks"]) + len(shared_state["pick_tasks"])
-            if current_backlog < queue_limit and task_list:
+            if task_list and current_backlog < queue_limit:
                 batch = min(5, len(task_list))
                 for _ in range(batch):
                     t = task_list.pop(0)
@@ -229,6 +228,8 @@ def task_dispatcher(env, task_list):
                         shared_state["release_tasks"].append(t)
                     else:
                         shared_state["pick_tasks"].append(t)
+
+        # 每秒检查一次
         yield env.timeout(1.0)
 
 
@@ -285,16 +286,12 @@ def controller(env, s_id, input_locks, output_locks, algorithm):
                 with input_locks[target_port].request() as req:
                     yield req
                     reached_port = yield env.process(robust_move(env, s_id, target_port, algorithm))
-
                     if reached_port:
                         yield env.process(execute_op_sim(env, s_id, PARK_TIME, "取货"))
                         with state_lock:
                             shared_state["shuttles"][s_id]["Load"] = True
-
                         reached_slot = yield env.process(robust_move(env, s_id, task.position, algorithm))
-                        if reached_slot:
-                            success = True
-
+                        if reached_slot: success = True
                 if success:
                     yield env.process(execute_op_sim(env, s_id, PARK_TIME, "放货"))
                     with state_lock:
@@ -305,7 +302,6 @@ def controller(env, s_id, input_locks, output_locks, algorithm):
 
             elif t_type == "pick":
                 reached_slot = yield env.process(robust_move(env, s_id, task.position, algorithm))
-
                 if reached_slot:
                     yield env.process(execute_op_sim(env, s_id, RETRIEVE_TIME, "取货"))
                     with state_lock:
@@ -319,13 +315,11 @@ def controller(env, s_id, input_locks, output_locks, algorithm):
                     with output_locks[target_port].request() as req:
                         yield req
                         reached_port = yield env.process(robust_move(env, s_id, target_port, algorithm))
-
                         if reached_port:
                             yield env.process(execute_op_sim(env, s_id, RETRIEVE_TIME, "卸货"))
                             with state_lock:
                                 shared_state["shuttles"][s_id]["Load"] = False
                             success = True
-
                             yield env.timeout(0.5)
                             rest_pos = None
                             with state_lock:
@@ -339,7 +333,7 @@ def controller(env, s_id, input_locks, output_locks, algorithm):
                                             break
                                     if rest_pos: break
                             if rest_pos:
-                                env.process(robust_move(env, s_id, rest_pos, algorithm))
+                                yield env.process(robust_move(env, s_id, rest_pos, algorithm))
 
             if algorithm == "IDQN" and DRL_ENABLED:
                 end_time = env.now
@@ -419,16 +413,19 @@ def run_comparison_sim(algorithm_name, task_list_copy):
 
     env.process(task_dispatcher(env, task_list_copy))
 
-    try:
-        env.run(until=5000)
-    except Exception as e:
-        print(f"Sim Error: {e}")
+    # === 关键修正: 步进运行 ===
+    # 只要 shared_state["done"] 为 False，就一直跑，直到超时
+    timeout = 200000
+    step_size = 1.0
+
+    while not shared_state["done"] and env.now < timeout:
+        env.run(until=env.now + step_size)
 
     result = {
         "Algorithm": algorithm_name,
         "Completed": shared_state["completed_tasks"],
         "Failed": shared_state["failed_tasks"],
-        "Time_Sim": env.now,
+        "Time_Sim": env.now,  # 现在记录的是真实结束时间
         "Avg_Plan_Time_ms": (shared_state["total_planning_time"] / shared_state["planning_count"]) if shared_state[
             "planning_count"] else 0,
         "Avg_Path_Len": (shared_state["total_path_length"] / shared_state["path_count"]) if shared_state[
