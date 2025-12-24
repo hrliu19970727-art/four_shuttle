@@ -10,7 +10,7 @@ PLANNING_ALGORITHM = "A_STAR"
 # PLANNING_ALGORITHM = "BFS"
 
 # --- 实体数量 ---
-SHUTTLES = 4
+SHUTTLES = 6
 
 # --- 时间参数 ---
 MOVE_TIME = 0.2

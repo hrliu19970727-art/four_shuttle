@@ -146,7 +146,6 @@ def draw_info_panel(screen):
     screen.blit(fl.render(f"{current_time:.1f} s", True, COLOR_TEXT_MAIN), (x_sys + 10, y + 80))
 
     # --- 算法性能卡片 ---
-    # 计算平均值
     total_time = shared_state.get("total_planning_time", 0)
     count = shared_state.get("planning_count", 0)
     total_len = shared_state.get("total_path_length", 0)
@@ -160,14 +159,16 @@ def draw_info_panel(screen):
     screen.blit(fs.render(f"Avg Time: {avg_time:.2f} ms", True, COLOR_TEXT_MAIN), (x_sys, y_perf + 20))
     screen.blit(fs.render(f"Avg Steps: {avg_len:.1f}", True, COLOR_TEXT_MAIN), (x_sys, y_perf + 40))
 
-    # === 2. 车辆状态 ===
+    # === 2. 车辆状态 (修改：只显示前4辆，双列显示) ===
     x_shuttle = 220
     screen.blit(fm.render("Fleet Status", True, COLOR_TEXT_DIM), (x_shuttle, y))
 
     shuttles = shared_state.get("shuttles", [])
-    for i, s in enumerate(shuttles[:6]):
-        col_idx = i % 3
-        row_idx = i // 3
+    # [修改点] 切片改为 :4
+    for i, s in enumerate(shuttles[:4]):
+        # [修改点] 3列变2列
+        col_idx = i % 2
+        row_idx = i // 2
         cx = x_shuttle + col_idx * 150
         cy = y + 30 + row_idx * 90
 
@@ -186,8 +187,9 @@ def draw_info_panel(screen):
             task_col = COLOR_TASK_REL if is_load else COLOR_TASK_PICK
             pygame.draw.circle(screen, task_col, (cx + 130, cy + 15), 4)
 
-    # === 3. 统计仪表盘 ===
-    x_stats = 700
+    # === 3. 统计仪表盘 (修改：左移) ===
+    # [修改点] x_stats 从 700 改为 540，填补减少车辆卡片后的空白
+    x_stats = 540
     w_stats = TOTAL_WIDTH - x_stats - 20
     pygame.draw.rect(screen, (35, 37, 40), (x_stats, y, w_stats, 200), border_radius=10)
     pygame.draw.rect(screen, (60, 60, 60), (x_stats, y, w_stats, 200), 1, border_radius=10)
